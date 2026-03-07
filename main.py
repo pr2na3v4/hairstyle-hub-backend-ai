@@ -1,101 +1,134 @@
 import cv2
 import numpy as np
+import os
+import gc
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from detector import FaceShapeDetector
+from contextlib import asynccontextmanager
 
-# --- 1. CONFIGURATION & INITIALIZATION ---
-app = FastAPI(
-    title="HairstyleHub AI",
-    description="API for detecting face shapes using OpenCV and Machine Learning.",
-    version="1.1.0"
-)
+# --- 1. OPTIMIZED DETECTOR CLASS ---
+class FaceShapeDetector:
+    def __init__(self, model_path, cascade_path):
+        if not os.path.exists(cascade_path):
+            raise FileNotFoundError(f"Cascade missing: {cascade_path}")
+        self.face_cascade = cv2.CascadeClassifier(cascade_path)
+        
+        self.facemark = cv2.face.createFacemarkKazemi()
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model missing: {model_path}")
+        self.facemark.loadModel(model_path)
 
-# Paths (Use absolute paths or environment variables for production)
-CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-MODEL_PATH = "models/face_landmark_model.dat"
+    def _get_landmarks(self, image):
+        max_dim = 800
+        h, w = image.shape[:2]
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        
+        faces = self.face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(30, 30))
+        
+        if len(faces) == 0:
+            return None
+        
+        ok, landmarks = self.facemark.fit(image, faces)
+        del gray # Free memory immediately
+        
+        if not ok or len(landmarks) == 0:
+            return None
+            
+        return landmarks[0][0]
 
-# Initialize Detector (Singleton pattern)
-try:
+    def classify_shape(self, image):
+        points = self._get_landmarks(image)
+        if points is None:
+            return "No face detected", 0.0
+
+        try:
+            # Euclidean distance logic
+            def dist(p1, p2): return np.linalg.norm(np.array(p1) - np.array(p2))
+
+            jaw_w = dist(points[4], points[12])
+            cheek_w = dist(points[2], points[14])
+            forehead_w = dist(points[19], points[24])
+            face_len = dist(points[27], points[8])
+            ratio_lw = face_len / cheek_w
+            
+            if ratio_lw > 1.25: shape = "Oblong"
+            elif (jaw_w / cheek_w) > 0.9: shape = "Square"
+            elif (forehead_w / cheek_w) > 0.85 and (jaw_w / cheek_w) < 0.8: shape = "Heart"
+            elif 0.9 <= ratio_lw <= 1.05: shape = "Round"
+            else: shape = "Oval"
+
+            return shape, round(float(ratio_lw), 2)
+        finally:
+            del points
+            gc.collect()
+
+# --- 2. API LIFESPAN MANAGEMENT ---
+# Loads the model once when the server starts to save time and memory
+detector = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global detector
+    MODEL_PATH = "models/face_landmark_model.dat"
+    CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
     detector = FaceShapeDetector(MODEL_PATH, CASCADE_PATH)
-except Exception as e:
-    print(f"CRITICAL: Could not initialize AI model: {e}")
-    # In production, you might want to exit if the model fails to load
-    detector = None
+    yield
+    del detector
+    gc.collect()
 
-# --- 2. MIDDLEWARE (CORS) ---
-# Define allowed origins for security
-origins = [
-    "http://localhost:5500",           # Local Live Server
-    "http://127.0.0.1:5500",           # Local IP
-    "https://your-hairstylehub.com",    # Production domain
-    "https://your-username.github.io", # GitHub Pages
-]
+# --- 3. FASTAPI APP SETUP ---
+app = FastAPI(lifespan=lifespan, title="HairstyleHub AI")
 
+# Production CORS - Replace "*" with your actual domain when ready
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_origins=["*"], 
+    allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
 
-# --- 3. ENDPOINTS ---
-
 @app.get("/")
-async def root():
-    """Health check endpoint."""
-    return {
-        "status": "online",
-        "model_loaded": detector is not None,
-        "message": "Welcome to HairstyleHub AI API"
-    }
+async def health():
+    return {"status": "online", "model_ready": detector is not None}
 
 @app.post("/analyze-face")
 async def analyze_face(file: UploadFile = File(...)):
-    """
-    Receives an image, identifies face shape, and returns geometric ratios.
-    """
-    # 1. Validation: File Type
     if not file.content_type.startswith('image/'):
-        raise HTTPException(status_code=400, detail="Uploaded file is not an image.")
-
-    # 2. Validation: Model Status
-    if detector is None:
-        raise HTTPException(status_code=500, detail="AI Model is not loaded on server.")
+        raise HTTPException(status_code=400, detail="Invalid image file")
 
     try:
-        # 3. Efficient Image Loading
-        # Read directly from memory buffer (avoids slow disk I/O)
+        # Read file into memory buffer efficiently
         contents = await file.read()
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
+        
         if img is None:
-            raise HTTPException(status_code=400, detail="Could not decode image.")
+            raise HTTPException(status_code=400, detail="Could not decode image")
 
-        # 4. Processing
         shape, ratio = detector.classify_shape(img)
+        
+        # Immediate cleanup
+        del img
+        del nparr
+        gc.collect()
 
-        # 5. Production Result Format
         return {
             "status": "success",
-            "data": {
-                "detected_shape": shape,
-                "metric_ratio": ratio,
-            },
-            "meta": {
-                "filename": file.filename,
-                "message": f"Successfully detected {shape} face shape."
-            }
+            "detected_shape": shape,
+            "metric_ratio": ratio
         }
 
     except Exception as e:
-        # Log the error here in a real production app
-        return {"status": "error", "message": "An internal error occurred during processing."}
+        gc.collect()
+        raise HTTPException(status_code=500, detail=str(e))
 
-# --- 4. EXECUTION ---
 if __name__ == "__main__":
-    # In production, uvicorn is usually run via CLI, but this works for development
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # Render uses the PORT environment variable
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
