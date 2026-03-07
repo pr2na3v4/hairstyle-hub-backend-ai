@@ -42,14 +42,9 @@ async def favicon():
     """Stops the 404 logs from browsers looking for an icon."""
     return Response(status_code=204)
 
-@app.get("/")
+@app.get("/", methods=["GET", "HEAD"])
 def read_root():
-    """Health check endpoint."""
-    return {
-        "status": "online",
-        "message": "Welcome to the HairstyleHub AI Backend!",
-        "model_loaded": detector is not None
-    }
+    return {"status": "online", "message": "Backend is running!"}
 
 @app.post("/analyze-face")
 async def analyze(file: UploadFile = File(...)):
