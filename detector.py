@@ -62,40 +62,43 @@ class FaceShapeDetector:
         return np.linalg.norm(np.array(p1) - np.array(p2))
 
     def classify_shape(self, image):
-        """
-        Analyzes geometric ratios of the face to determine shape.
-        """
         points = self._get_landmarks(image)
-        
         if points is None:
             return "No face detected", 0.0
 
         try:
-            # Feature Extraction (Based on standard 68-point facial landmarks)
-            # Jaw Width (Point 4 to 12)
-            jaw_w = self._dist(points[4], points[12])
-            
-            # Cheekbone Width (Point 2 to 14)
-            cheek_w = self._dist(points[2], points[14])
-            
-            # Forehead Width (Point 19 to 24)
-            forehead_w = self._dist(points[19], points[24])
-            
-            # Face Length (Mid-brow 27 to Chin 8)
-            face_len = self._dist(points[27], points[8])
+            def dist(p1, p2): return np.linalg.norm(np.array(p1) - np.array(p2))
 
-            # Ratio: Length / Width
+            # 1. MEASUREMENTS
+            # Jaw Width: Point 4 to 12
+            jaw_w = dist(points[4], points[12])
+            # Cheekbone Width: Point 2 to 14
+            cheek_w = dist(points[2], points[14])
+            # Forehead Width: Point 19 to 24 (Approximate brow width)
+            forehead_w = dist(points[19], points[24])
+            # Face Length: Point 27 (top of nose) to 8 (bottom of chin)
+            # Note: We multiply by 1.3 to estimate full height from hairline
+            face_len = dist(points[27], points[8]) * 1.3 
+
+            # 2. RATIOS (The Secret Sauce)
             ratio_lw = face_len / cheek_w
-            
-            # --- Geometric Classification Logic ---
-            if ratio_lw > 1.25:
+            jaw_to_cheek = jaw_w / cheek_w
+            forehead_to_cheek = forehead_w / cheek_w
+
+            # 3. REFINED CLASSIFICATION
+            # Oblong: Face is significantly longer than it is wide
+            if ratio_lw > 1.4:
                 shape = "Oblong"
-            elif (jaw_w / cheek_w) > 0.9:
+            # Square: Wide jaw, jaw width is almost equal to cheek width
+            elif jaw_to_cheek > 0.88:
                 shape = "Square"
-            elif (forehead_w / cheek_w) > 0.85 and (jaw_w / cheek_w) < 0.8:
+            # Heart: Forehead is wider than jaw, chin is pointed
+            elif forehead_to_cheek > 0.8 and jaw_to_cheek < 0.75:
                 shape = "Heart"
-            elif 0.9 <= ratio_lw <= 1.05:
+            # Round: Length and width are nearly equal, jaw is softer
+            elif 0.9 <= ratio_lw <= 1.1 and jaw_to_cheek < 0.85:
                 shape = "Round"
+            # Oval: The balanced middle ground
             else:
                 shape = "Oval"
 
