@@ -1,11 +1,5 @@
 import sys
 import asyncio
-
-# 1. WINDOWS STABILITY FIX (Must be at the top)
-# This prevents the 'WinError 10054' and connection reset logs on Windows
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
 import cv2
 import numpy as np
 import gc
@@ -16,20 +10,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from detector import FaceMeshDetector
 
+# 1. WINDOWS STABILITY FIX
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 # 2. APP INITIALIZATION
 app = FastAPI(title="HairstyleHub AI")
 
 # 3. CORS CONFIGURATION
-# Added GET and OPTIONS for better browser compatibility
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
-    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_methods=["POST", "GET", "OPTIONS", "HEAD"],
     allow_headers=["*"],
 )
 
 # 4. MODEL INITIALIZATION
-# Initialized at the module level for Phase 1
 try:
     detector = FaceMeshDetector()
 except Exception as e:
@@ -39,12 +35,12 @@ except Exception as e:
 # 5. ROUTES
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
-    """Stops the 404 logs from browsers looking for an icon."""
     return Response(status_code=204)
 
-@app.get("/")
+@app.get("/", methods=["GET", "HEAD"])
 def read_root():
-    return {"status": "online", "message": "Backend is running!"}
+    """Handles Render health checks and browser pings."""
+    return {"status": "online", "message": "HairstyleHub AI Backend is active"}
 
 @app.post("/analyze-face")
 async def analyze(file: UploadFile = File(...)):
@@ -62,33 +58,40 @@ async def analyze(file: UploadFile = File(...)):
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
-            raise HTTPException(status_code=400, detail="Invalid image data. Could not decode.")
+            raise HTTPException(status_code=400, detail="Could not decode image.")
 
         # AI Processing
-        # The detector handles the 6-shape logic and pose validation
-        # AI Processing
-        result = detector.classify_shape(img)
+        analysis = detector.classify_shape(img)
         
-        # Cleanup
+        # Cleanup immediately to save RAM
         del img
         del nparr
         gc.collect()
 
+        # Handle case where no face is found or pose is invalid
+        if analysis is None:
+            return {"status": "error", "message": "No face detected. Please try again."}
+        
+        if "error" in analysis:
+            return {"status": "error", "message": analysis["error"]}
+
+        # 6. RETURN STRUCTURE (Matches Team Requirements)
         return {
             "status": "success",
-            "detected_shape": result["shape"],
-            "metric_ratio": result["ratio"],
-            "debug_metrics": result["debug"], # Now you'll see pixels in console
+            "detected_shape": analysis["detected_shape"],
+            "confidence": analysis["confidence"],
+            "metric_ratio": analysis["metric_ratio"],
+            "debug_metrics": analysis["debug"],
             "message": "Analysis complete"
         }
 
     except Exception as e:
         gc.collect()
-        return {"status": "error", "message": f"Server Error: {str(e)}"}
+        print(f"Server Error: {str(e)}")
+        return {"status": "error", "message": "An internal server error occurred."}
 
-# 6. SERVER START
+# 7. SERVER START
 if __name__ == "__main__":
-    # Render uses the PORT environment variable; local defaults to 8000
     port = int(os.environ.get("PORT", 8000))
-    # 'workers=1' is critical for staying under 512MB RAM
+    # 'workers=1' is mandatory for 512MB RAM limits on Render Free Tier
     uvicorn.run(app, host="0.0.0.0", port=port, workers=1)
