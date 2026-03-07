@@ -1,134 +1,99 @@
+import sys
+import asyncio
+
+# 1. WINDOWS STABILITY FIX (Must be at the top)
+# This prevents the 'WinError 10054' and connection reset logs on Windows
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 import cv2
 import numpy as np
-import os
 import gc
+import os
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
+from fastapi.responses import Response
+from detector import FaceMeshDetector
 
-# --- 1. OPTIMIZED DETECTOR CLASS ---
-class FaceShapeDetector:
-    def __init__(self, model_path, cascade_path):
-        if not os.path.exists(cascade_path):
-            raise FileNotFoundError(f"Cascade missing: {cascade_path}")
-        self.face_cascade = cv2.CascadeClassifier(cascade_path)
-        
-        self.facemark = cv2.face.createFacemarkKazemi()
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model missing: {model_path}")
-        self.facemark.loadModel(model_path)
+# 2. APP INITIALIZATION
+app = FastAPI(title="HairstyleHub AI")
 
-    def _get_landmarks(self, image):
-        max_dim = 800
-        h, w = image.shape[:2]
-        if max(h, w) > max_dim:
-            scale = max_dim / max(h, w)
-            image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-        
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
-        
-        faces = self.face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(30, 30))
-        
-        if len(faces) == 0:
-            return None
-        
-        ok, landmarks = self.facemark.fit(image, faces)
-        del gray # Free memory immediately
-        
-        if not ok or len(landmarks) == 0:
-            return None
-            
-        return landmarks[0][0]
-
-    def classify_shape(self, image):
-        points = self._get_landmarks(image)
-        if points is None:
-            return "No face detected", 0.0
-
-        try:
-            # Euclidean distance logic
-            def dist(p1, p2): return np.linalg.norm(np.array(p1) - np.array(p2))
-
-            jaw_w = dist(points[4], points[12])
-            cheek_w = dist(points[2], points[14])
-            forehead_w = dist(points[19], points[24])
-            face_len = dist(points[27], points[8])
-            ratio_lw = face_len / cheek_w
-            
-            if ratio_lw > 1.25: shape = "Oblong"
-            elif (jaw_w / cheek_w) > 0.9: shape = "Square"
-            elif (forehead_w / cheek_w) > 0.85 and (jaw_w / cheek_w) < 0.8: shape = "Heart"
-            elif 0.9 <= ratio_lw <= 1.05: shape = "Round"
-            else: shape = "Oval"
-
-            return shape, round(float(ratio_lw), 2)
-        finally:
-            del points
-            gc.collect()
-
-# --- 2. API LIFESPAN MANAGEMENT ---
-# Loads the model once when the server starts to save time and memory
-detector = None
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global detector
-    MODEL_PATH = "models/face_landmark_model.dat"
-    CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-    detector = FaceShapeDetector(MODEL_PATH, CASCADE_PATH)
-    yield
-    del detector
-    gc.collect()
-
-# --- 3. FASTAPI APP SETUP ---
-app = FastAPI(lifespan=lifespan, title="HairstyleHub AI")
-
-# Production CORS - Replace "*" with your actual domain when ready
+# 3. CORS CONFIGURATION
+# Added GET and OPTIONS for better browser compatibility
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
-    allow_methods=["POST", "GET"],
+    allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
+# 4. MODEL INITIALIZATION
+# Initialized at the module level for Phase 1
+try:
+    detector = FaceMeshDetector()
+except Exception as e:
+    print(f"Critical Error: Failed to load FaceMeshDetector: {e}")
+    detector = None
+
+# 5. ROUTES
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """Stops the 404 logs from browsers looking for an icon."""
+    return Response(status_code=204)
+
 @app.get("/")
-async def health():
-    return {"status": "online", "model_ready": detector is not None}
+def read_root():
+    """Health check endpoint."""
+    return {
+        "status": "online",
+        "message": "Welcome to the HairstyleHub AI Backend!",
+        "model_loaded": detector is not None
+    }
 
 @app.post("/analyze-face")
-async def analyze_face(file: UploadFile = File(...)):
-    if not file.content_type.startswith('image/'):
-        raise HTTPException(status_code=400, detail="Invalid image file")
+async def analyze(file: UploadFile = File(...)):
+    # Validation: Ensure it's an image
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload a valid image file.")
+
+    if detector is None:
+        raise HTTPException(status_code=500, detail="AI Model not initialized.")
 
     try:
-        # Read file into memory buffer efficiently
+        # Efficient Image Loading
         contents = await file.read()
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
-            raise HTTPException(status_code=400, detail="Could not decode image")
+            raise HTTPException(status_code=400, detail="Invalid image data. Could not decode.")
 
-        shape, ratio = detector.classify_shape(img)
+        # AI Processing
+        # The detector handles the 6-shape logic and pose validation
+        # AI Processing
+        result = detector.classify_shape(img)
         
-        # Immediate cleanup
+        # Cleanup
         del img
         del nparr
         gc.collect()
 
         return {
             "status": "success",
-            "detected_shape": shape,
-            "metric_ratio": ratio
+            "detected_shape": result["shape"],
+            "metric_ratio": result["ratio"],
+            "debug_metrics": result["debug"], # Now you'll see pixels in console
+            "message": "Analysis complete"
         }
 
     except Exception as e:
         gc.collect()
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"status": "error", "message": f"Server Error: {str(e)}"}
 
+# 6. SERVER START
 if __name__ == "__main__":
-    # Render uses the PORT environment variable
+    # Render uses the PORT environment variable; local defaults to 8000
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # 'workers=1' is critical for staying under 512MB RAM
+    uvicorn.run(app, host="0.0.0.0", port=port, workers=1)

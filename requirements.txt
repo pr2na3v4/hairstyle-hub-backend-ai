@@ -1,11 +1,6 @@
-# Web Framework & Server
-fastapi==0.135.1
-uvicorn==0.34.0
-
-# Image Processing (Headless for Server)
-# We use the -headless version to save ~100MB of RAM
-opencv-contrib-python==4.13.0.92
-numpy==2.4.0
-
-# Utility
-python-multipart==0.0.20
+fastapi==0.115.0
+uvicorn==0.30.6
+mediapipe==0.10.14
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+python-multipart==0.0.9
