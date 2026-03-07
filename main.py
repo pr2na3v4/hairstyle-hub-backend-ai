@@ -37,7 +37,7 @@ except Exception as e:
 async def favicon():
     return Response(status_code=204)
 
-@app.get("/", methods=["GET", "HEAD"])
+@app.get("/")
 def read_root():
     """Handles Render health checks and browser pings."""
     return {"status": "online", "message": "HairstyleHub AI Backend is active"}
