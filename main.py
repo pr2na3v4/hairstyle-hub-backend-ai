@@ -42,7 +42,7 @@ async def favicon():
     """Stops the 404 logs from browsers looking for an icon."""
     return Response(status_code=204)
 
-@app.get("/", methods=["GET", "HEAD"])
+@app.get("/")
 def read_root():
     return {"status": "online", "message": "Backend is running!"}
 
