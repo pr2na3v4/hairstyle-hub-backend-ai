@@ -4,249 +4,227 @@ import numpy as np
 import gc
 
 
-# =============================================================================
-#  MEDIAPIPE 468-LANDMARK MAP  (key points used in this detector)
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+#  LANDMARK REFERENCE  (MediaPipe 468-point map)
+# ─────────────────────────────────────────────────────────────────────────────
 #
-#   FACE HEIGHT
-#     [10]  → Top of forehead (hairline midpoint)
-#    [152]  → Chin tip (bottom of face)
+#  FACE HEIGHT
+#    [10]  hairline midpoint (top of forehead)
+#   [152]  chin tip
 #
-#   FOREHEAD WIDTH  (true lateral forehead, above eyebrows)
-#    [103]  → Left  temporal / lateral forehead   ← KEPT (acceptable)
-#    [332]  → Right temporal / lateral forehead   ← KEPT (acceptable)
-#   NOTE: replaced inner-eyebrow points with outer temporal points for
-#         a wider, more stable forehead reading.
+#  WIDTHS
+#   [103] / [332]  lateral forehead  (temporal, above brow arch)
+#   [234] / [454]  zygomatic arch    (widest cheekbone point)
+#   [172] / [397]  gonial angle      (true jaw corners, not mid-jaw)
 #
-#   CHEEKBONE WIDTH  (widest zygomatic arch — most reliable width)
-#    [234]  → Left  zygomatic (cheekbone)
-#    [454]  → Right zygomatic (cheekbone)
+#  POSE CHECK  (nose-tip → outer eye corner symmetry)
+#     [1]  nose tip
+#   [130] / [359]  outer eye corners  (wider baseline than inner [33]/[263])
 #
-#   JAW WIDTH  (true gonial angle / jaw-corner points)
-#     OLD: [132] / [361]  — mid-jaw, not jaw angle
-#     NEW: [172] / [397]  — gonial angle (jaw corners) — more accurate
-#
-#   JAW TIP
-#    [152]  → Chin (shared with face height)
-#
-#   POSE / SYMMETRY CHECK  (outer eye corners for left-right balance)
-#     OLD: [33]  / [263]  — inner eye corners
-#     NEW: [130] / [359]  — outer eye corners → wider baseline = better tilt signal
-#
-#   NOSE TIP (for pose reference point)
-#     [1]   → Nose tip
-#
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Thresholds (centralised — tune here, nowhere else) ───────────────────────
+_T = {
+    # ── shape boundaries ─────────────────────────────────────────────────────
+    "oblong_lw_min"  : 1.55,   # lw above this → definitely elongated
+    "oblong_jc_min"  : 0.80,   # jaw must be present (not heart-like)
+
+    "square_lw_max"  : 1.22,   # nearly as wide as tall
+    "square_jc_min"  : 0.90,   # strong, wide jaw
+    "square_fc_min"  : 0.85,   # wide forehead too (all three rows equal)
+
+    "round_lw_max"   : 1.25,   # compact face
+    "round_jc_max"   : 0.90,   # softer jaw than square
+    "round_fc_min"   : 0.80,   # full, wide forehead
+
+    "heart_fj_min"   : 1.25,   # forehead clearly wider than jaw
+    "heart_jc_max"   : 0.75,   # narrow jaw relative to cheeks
+    "heart_fc_min"   : 0.82,   # forehead ≥ cheeks (separates from Diamond)
+
+    "tri_fj_max"     : 0.85,   # jaw wider than forehead (inverse of Heart)
+    "tri_jc_min"     : 0.88,   # jaw wide relative to cheeks
+
+    "diamond_fc_max" : 0.82,   # forehead narrower than cheeks
+    "diamond_jc_max" : 0.85,   # jaw narrower than cheeks
+    #                            NOTE: lw guard removed — short Diamonds exist
+
+    # ── pose ─────────────────────────────────────────────────────────────────
+    "pose_ratio_max" : 1.20,   # nose-to-outer-eye symmetry limit (~±10° yaw)
+
+    # ── confidence  (ideal_value, tolerance) ─────────────────────────────────
+    "conf_oblong"    : (1.65, 0.12),
+    "conf_square"    : (0.93, 0.05),   # driven by jc
+    "conf_round"     : (1.13, 0.10),   # driven by lw
+    "conf_heart"     : (1.35, 0.10),   # driven by fj
+    "conf_triangle"  : (0.78, 0.08),   # driven by fj
+    "conf_diamond"   : (0.74, 0.08),   # driven by avg(fc, jc)
+    "conf_oval"      : (1.30, 0.30),   # wider tolerance — Oval is the broad default
+    #                                    FIX: was (1.40, 0.18) → lw~1.18 bottomed at 50%
+}
 
 
 class FaceMeshDetector:
 
-    # ------------------------------------------------------------------ init
+    # ──────────────────────────────────────────────────────────── init ────────
     def __init__(self):
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            static_image_mode=True,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
+        self._mp_mesh = mp.solutions.face_mesh
+        self._mesh    = self._mp_mesh.FaceMesh(
+            static_image_mode        = True,
+            max_num_faces            = 1,
+            refine_landmarks         = True,
+            min_detection_confidence = 0.5,
         )
 
-    # -------------------------------------------------------- landmark fetch
-    def _get_landmarks(self, image):
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(rgb)
+    # ──────────────────────────────────────────────── private helpers ─────────
+    def _landmarks(self, image):
+        """BGR image → landmark list, or None if no face found."""
+        rgb     = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        results = self._mesh.process(rgb)
         if not results.multi_face_landmarks:
             return None
         return results.multi_face_landmarks[0].landmark
 
-    # ------------------------------------------------------- Euclidean dist
-    def _dist(self, p1, p2, w, h):
-        """Pixel-space Euclidean distance between two normalised landmarks."""
-        dx = (p2.x - p1.x) * w
-        dy = (p2.y - p1.y) * h
-        return float(np.sqrt(dx * dx + dy * dy))
+    def _px_dist(self, lm, i, j, w, h):
+        """Pixel-space Euclidean distance between landmark indices i and j."""
+        dx = (lm[j].x - lm[i].x) * w
+        dy = (lm[j].y - lm[i].y) * h
+        return float(np.hypot(dx, dy))
 
-    # --------------------------------------------------------- pose check
-    def _validate_pose(self, lm, w, h):
+    def _pose_ok(self, lm, w, h):
         """
-        Symmetry check: distance from nose tip to each outer eye corner.
-        If the face is rotated left/right these distances diverge.
-        Outer corners [130] / [359] give a wider, more sensitive baseline
-        than the old inner-corner pair [33] / [263].
-
-        Threshold 1.20  →  allows ~±10° yaw before rejection.
+        Left-right symmetry check.
+        Measures nose-tip [1] → outer eye corner [130] and [359].
+        Outer corners give ~40 % wider baseline than inner corners [33]/[263],
+        making yaw detection more sensitive.
+        Rejects frame when asymmetry ratio exceeds pose_ratio_max (~±10° yaw).
         """
-        left_dist  = self._dist(lm[1], lm[130], w, h)
-        right_dist = self._dist(lm[1], lm[359], w, h)
-        if min(left_dist, right_dist) == 0:
+        l = self._px_dist(lm, 1, 130, w, h)
+        r = self._px_dist(lm, 1, 359, w, h)
+        if min(l, r) == 0:
             return False
-        ratio = max(left_dist, right_dist) / min(left_dist, right_dist)
-        return ratio < 1.20
+        return (max(l, r) / min(l, r)) < _T["pose_ratio_max"]
 
-    # ------------------------------------------------------- confidence calc
     @staticmethod
-    def _confidence(value, ideal, tolerance):
+    def _conf(value, ideal, tolerance):
         """
-        Gaussian-style confidence that peaks at 1.0 when value == ideal and
-        falls to ~0.50 at ±1 tolerance from the ideal.
+        Gaussian confidence score.
+          • Peaks at 100 % when value == ideal.
+          • Falls to ~60 % at ±1 tolerance.
+          • Hard floor of 50 % — we never imply near-zero certainty.
 
-        Using a Gaussian (exp) instead of linear avoids the hard cliff-edge
-        behaviour of the old approach and scales naturally across different
-        ratio ranges.
+        σ = tolerance / 1.4427  gives exp(−0.5) ≈ 0.607 at exactly 1σ.
+        Gaussian avoids the hard cliff-edge of linear decay and scales
+        consistently across different ratio ranges.
         """
-        diff = abs(value - ideal)
-        sigma = tolerance / 1.4427          # tune: 1σ ≈ tolerance
-        conf  = np.exp(-(diff ** 2) / (2 * sigma ** 2))
-        return round(max(0.50, conf) * 100, 1)
+        sigma = tolerance / 1.4427
+        conf  = np.exp(-((value - ideal) ** 2) / (2 * sigma ** 2))
+        return round(max(0.50, float(conf)) * 100, 1)
 
-    # ====================================================== classify_shape ==
-    def classify_shape(self, image):
+    # ──────────────────────────────────────────────────── public API ──────────
+    def classify_shape(self, image) -> dict:
         """
-        Returns a dict with:
-          detected_shape  – one of 7 shape labels
-          confidence      – string "XX.X%"
-          metric_ratio    – primary ratio used for classification
-          debug           – all four raw ratios for inspection
+        Classify the face shape in a BGR image.
+
+        Returns
+        -------
+        dict with keys:
+          detected_shape  – Oblong | Square | Round | Heart |
+                            Triangle | Diamond | Oval
+          confidence      – "XX.X%"  (capped at 98 % for realism)
+          metric_ratio    – face-length / cheek-width  (primary ratio)
+          debug           – raw pixel sizes + all four ratios
+          error           – present only on failure; all other keys absent
         """
         h, w, _ = image.shape
-        lm = self._get_landmarks(image)
+        lm = self._landmarks(image)
 
         if lm is None:
-            return {"error": "No face detected"}
+            return {"error": "No face detected — ensure good lighting and a clear view"}
 
-        if not self._validate_pose(lm, w, h):
-            return {"error": "Face tilted – please look straight at the camera"}
+        if not self._pose_ok(lm, w, h):
+            return {"error": "Face tilted — please look straight at the camera"}
 
-        # ----------------------------------------------------------------
-        # STEP 1  –  MEASURE KEY DIMENSIONS  (all in pixels)
-        # ----------------------------------------------------------------
-        face_len    = self._dist(lm[10],  lm[152], w, h)   # hairline → chin
-        forehead_w  = self._dist(lm[103], lm[332], w, h)   # lateral forehead
-        cheek_w     = self._dist(lm[234], lm[454], w, h)   # zygomatic arch
-        jaw_w       = self._dist(lm[172], lm[397], w, h)   # gonial angle corners
+        # ── 1. pixel measurements ─────────────────────────────────────────────
+        D = lambda i, j: self._px_dist(lm, i, j, w, h)  # noqa: E731
 
-        # Safety guard — avoid division by zero on degenerate detections
-        if cheek_w < 1 or jaw_w < 1 or forehead_w < 1:
-            return {"error": "Landmark geometry is invalid – try a clearer image"}
+        face_len   = D(10,  152)   # hairline → chin
+        forehead_w = D(103, 332)   # lateral forehead width
+        cheek_w    = D(234, 454)   # zygomatic / cheekbone width  (widest)
+        jaw_w      = D(172, 397)   # gonial-angle jaw width
 
-        # ----------------------------------------------------------------
-        # STEP 2  –  DERIVED RATIOS
-        # ----------------------------------------------------------------
-        #  ratio_lw : face Length / cheek Width
-        #             Tells us how elongated the face is.
-        #             Oval ≈ 1.3–1.5 | Oblong > 1.5 | Round/Square < 1.25
+        if min(face_len, forehead_w, cheek_w, jaw_w) < 1.0:
+            return {"error": "Landmark geometry invalid — try a clearer, better-lit image"}
+
+        # ── 2. ratios ─────────────────────────────────────────────────────────
         #
-        #  ratio_fc : Forehead / Cheek
-        #             < 0.82 → forehead narrower than cheekbones (Diamond)
-        #             > 0.92 → forehead as wide as cheeks (Square / Heart)
+        #  lw  Length / cheek Width      → elongation index
+        #  fc  Forehead / Cheek          → forehead breadth vs widest point
+        #  jc  Jaw / Cheek               → jaw strength vs widest point
+        #  fj  Forehead / Jaw            → taper direction (Heart ↔ Triangle)
         #
-        #  ratio_jc : Jaw / Cheek
-        #             > 0.88 → jaw nearly as wide as cheeks (Square / Oblong)
-        #             < 0.75 → jaw notably narrower than cheeks (Heart / Diamond)
-        #
-        #  ratio_fj : Forehead / Jaw
-        #             > 1.20 → forehead wider than jaw (Heart)
-        #             < 0.85 → jaw wider than forehead (Triangle / Pear)
-        # ----------------------------------------------------------------
-        ratio_lw = face_len   / cheek_w
-        ratio_fc = forehead_w / cheek_w
-        ratio_jc = jaw_w      / cheek_w
-        ratio_fj = forehead_w / jaw_w
+        lw = face_len   / cheek_w
+        fc = forehead_w / cheek_w
+        jc = jaw_w      / cheek_w
+        fj = forehead_w / jaw_w
 
         debug = {
-            "face_len_px"  : round(face_len,   1),
-            "forehead_px"  : round(forehead_w, 1),
-            "cheek_px"     : round(cheek_w,    1),
-            "jaw_px"       : round(jaw_w,      1),
-            "l_w_ratio"    : round(ratio_lw,   3),
-            "f_c_ratio"    : round(ratio_fc,   3),
-            "j_c_ratio"    : round(ratio_jc,   3),
-            "f_j_ratio"    : round(ratio_fj,   3),
+            "face_len_px" : round(face_len,   1),
+            "forehead_px" : round(forehead_w, 1),
+            "cheek_px"    : round(cheek_w,    1),
+            "jaw_px"      : round(jaw_w,      1),
+            "l_w_ratio"   : round(lw, 3),
+            "f_c_ratio"   : round(fc, 3),
+            "j_c_ratio"   : round(jc, 3),
+            "f_j_ratio"   : round(fj, 3),
         }
 
-        # ----------------------------------------------------------------
-        # STEP 3  –  STRICT DECISION TREE
+        # ── 3. decision tree ──────────────────────────────────────────────────
         #
-        #  Priority order matters — each branch is evaluated only if all
-        #  previous branches were False.  Branches are ordered from the
-        #  most geometrically distinct shapes to the most "default" one.
-        # ----------------------------------------------------------------
+        #  Order: most geometrically distinct shapes first → broadest last.
+        #  Every branch requires ALL its guards — no single-ratio shortcuts.
+        #
+        t = _T
 
-        # --- 1. OBLONG ---------------------------------------------------
-        # Clearly elongated face; jaw and forehead both relatively wide
-        # so it isn't just a pointed oval.
-        #   Primary signal : ratio_lw > 1.55  (strict elongation)
-        #   Secondary guard: ratio_jc > 0.80  (jaw is present, not heart-shaped)
-        if ratio_lw > 1.55 and ratio_jc > 0.80:
-            shape = "Oblong"
-            conf  = self._confidence(ratio_lw, 1.65, 0.12)
+        if lw > t["oblong_lw_min"] and jc > t["oblong_jc_min"]:
+            # Clearly elongated; jaw present (not a pointed Oval or Heart)
+            shape, conf = "Oblong",   self._conf(lw,               *t["conf_oblong"])
 
-        # --- 2. SQUARE ---------------------------------------------------
-        # Face is nearly as wide as it is long AND the jaw is strong.
-        #   ratio_lw ≤ 1.22 → width close to length (boxy proportions)
-        #   ratio_jc ≥ 0.90 → jaw nearly as wide as cheekbones
-        #   ratio_fc ≥ 0.85 → forehead also wide (all three rows similar)
-        elif ratio_lw <= 1.22 and ratio_jc >= 0.90 and ratio_fc >= 0.85:
-            shape = "Square"
-            conf  = self._confidence(ratio_jc, 0.93, 0.05)
+        elif lw <= t["square_lw_max"] and jc >= t["square_jc_min"] and fc >= t["square_fc_min"]:
+            # Compact face; forehead, cheek, jaw all nearly equal width
+            shape, conf = "Square",   self._conf(jc,               *t["conf_square"])
 
-        # --- 3. ROUND ----------------------------------------------------
-        # Face is nearly as wide as it is long BUT jaw tapers more than Square.
-        #   ratio_lw ≤ 1.25 → still compact
-        #   ratio_jc < 0.90 → softer, rounded jaw (distinguishes from Square)
-        #   ratio_fc ≥ 0.80 → forehead width similar to cheeks (full round look)
-        elif ratio_lw <= 1.25 and ratio_jc < 0.90 and ratio_fc >= 0.80:
-            shape = "Round"
-            conf  = self._confidence(ratio_lw, 1.13, 0.10)
+        elif lw <= t["round_lw_max"] and jc < t["round_jc_max"] and fc >= t["round_fc_min"]:
+            # Compact, wide forehead, softer jaw — rounder than Square
+            shape, conf = "Round",    self._conf(lw,               *t["conf_round"])
 
-        # --- 4. HEART ----------------------------------------------------
-        # Wide forehead that tapers steeply to a narrow, pointed jaw.
-        #   ratio_fj > 1.25 → forehead clearly wider than jaw
-        #   ratio_jc < 0.75 → jaw narrow relative to cheekbones
-        #   ratio_fc ≥ 0.82 → forehead is at least as wide as cheekbones
-        #                      (distinguishes from Diamond where forehead is also narrow)
-        elif ratio_fj > 1.25 and ratio_jc < 0.75 and ratio_fc >= 0.82:
-            shape = "Heart"
-            conf  = self._confidence(ratio_fj, 1.35, 0.10)
+        elif fj > t["heart_fj_min"] and jc < t["heart_jc_max"] and fc >= t["heart_fc_min"]:
+            # Broad forehead, narrow jaw — classic V-taper
+            # fc ≥ 0.82 guards against Diamond (where forehead is ALSO narrow)
+            shape, conf = "Heart",    self._conf(fj,               *t["conf_heart"])
 
-        # --- 5. TRIANGLE (Pear) ------------------------------------------
-        # Wide jaw that is broader than the forehead — opposite of Heart.
-        #   ratio_fj < 0.85 → jaw notably wider than forehead
-        #   ratio_jc > 0.88 → jaw width relative to cheekbones is large
-        elif ratio_fj < 0.85 and ratio_jc > 0.88:
-            shape = "Triangle"
-            conf  = self._confidence(ratio_fj, 0.78, 0.08)
+        elif fj < t["tri_fj_max"] and jc > t["tri_jc_min"]:
+            # Inverse of Heart — jaw wider than forehead (pear / triangle)
+            shape, conf = "Triangle", self._conf(fj,               *t["conf_triangle"])
 
-        # --- 6. DIAMOND --------------------------------------------------
-        # Cheekbones are the WIDEST feature; both forehead and jaw are
-        # noticeably narrower.
-        #   ratio_fc < 0.82 → forehead narrower than cheekbones
-        #   ratio_jc < 0.82 → jaw narrower than cheekbones
-        #   ratio_lw > 1.25 → some elongation (diamond isn't as short as round)
-        #   ratio_fj: forehead and jaw may be similar size (not heart, not triangle)
-        elif ratio_fc < 0.82 and ratio_jc < 0.82 and ratio_lw > 1.25:
-            shape = "Diamond"
-            # Confidence driven by how symmetrically narrow both ends are
-            narrowness = (ratio_fc + ratio_jc) / 2
-            conf  = self._confidence(narrowness, 0.74, 0.08)
+        elif fc < t["diamond_fc_max"] and jc < t["diamond_jc_max"]:
+            # Cheekbones dominate — both forehead AND jaw narrower.
+            # FIX: lw guard (> 1.25) removed; short compact Diamonds are valid
+            #      (e.g. lw ~ 1.18 with fc=0.71, jc=0.83 → genuine Diamond).
+            narrowness   = (fc + jc) / 2
+            shape, conf  = "Diamond", self._conf(narrowness,       *t["conf_diamond"])
 
-        # --- 7. OVAL (default) -------------------------------------------
-        # Gently elongated, balanced proportions — the catch-all for faces
-        # that don't fit a more extreme shape.
-        #   Ideal LW ≈ 1.35–1.45; forehead slightly narrower than cheeks;
-        #   jaw gently tapers.
         else:
-            shape = "Oval"
-            conf  = self._confidence(ratio_lw, 1.40, 0.18)
+            # Balanced, gently elongated — the true default.
+            # FIX: ideal shifted 1.40→1.30, tolerance widened 0.18→0.30 so
+            #      lw values from ~1.0–1.6 score above 50 % confidence.
+            shape, conf = "Oval",     self._conf(lw,               *t["conf_oval"])
 
-        # ----------------------------------------------------------------
-        # STEP 4  –  RETURN
-        # ----------------------------------------------------------------
+        # ── 4. return ─────────────────────────────────────────────────────────
         gc.collect()
 
         return {
             "detected_shape" : shape,
-            "confidence"     : f"{min(98.0, conf)}%",
-            "metric_ratio"   : round(ratio_lw, 3),
+            "confidence"     : f"{min(98.0, conf):.1f}%",
+            "metric_ratio"   : round(lw, 3),
             "debug"          : debug,
         }
