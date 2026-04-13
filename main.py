@@ -67,7 +67,6 @@ async def _store_analysis(analysis: dict) -> None:
             "fc_ratio"       : debug["fc_ratio"],
             "jc_ratio"       : debug["jc_ratio"],
             "fj_ratio"       : debug["fj_ratio"],
-            "user_consent"   : False,
             "version"        : _MODEL_VERSION,
         }
 
