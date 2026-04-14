@@ -37,7 +37,7 @@ except Exception as e:
 # Backend URL — set BACKEND_API_URL env var on Render to override
 _BACKEND_URL = os.environ.get(
     "BACKEND_API_URL",
-    "https://hairstyle-hub-backend.onrender.com/api/face-analysis"
+    "https://hairstyle-hub-backend.onrender.com/api/face-analysis/save-face-data"
 )
 # AI model version — bump this in Render env vars when you retrain
 _MODEL_VERSION = os.environ.get("MODEL_VERSION", "1.0.0")
