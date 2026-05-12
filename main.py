@@ -80,9 +80,10 @@ async def _store_analysis(analysis: dict) -> None:
 
 #7. ROUTES
 
-@app.route('/ping', methods=['GET'])
+# ✅ Correct FastAPI syntax
+@app.get("/ping")
 def health_check():
-    return {"status": "online", "message": "Backend is warm"}, 200
+    return {"status": "online", "message": "Backend is warm"}
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
