@@ -161,6 +161,6 @@ async def analyze(file: UploadFile = File(...)):
 
 # 8. SERVER START
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    # workers=1 is mandatory for 512 MB RAM limit on Render free tier
-    uvicorn.run(app, host="0.0.0.0", port=port, workers=1)
+    port = int(os.environ.get("PORT", 10000))
+    # Bind to 0.0.0.0 so it's accessible externally
+    uvicorn.run(app, host="0.0.0.0", port=port)
